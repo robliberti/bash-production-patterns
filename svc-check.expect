@@ -1,0 +1,61 @@
+#!/usr/bin/expect -f
+
+# -------- CONFIG --------
+set timeout 20
+set host [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+set sudopass [lindex $argv 3]
+
+if {$host == "" || $user == "" || $pass == "" || $sudopass == ""} {
+    puts "Usage: expect_script <host> <user> <password> <sudo_password>"
+    exit 1
+}
+
+# -------- CONNECT --------
+spawn ssh -o StrictHostKeyChecking=no $user@$host
+
+expect {
+    "*yes/no*" {
+        send "yes\r"
+        exp_continue
+    }
+    "*assword:*" {
+        send "$pass\r"
+    }
+}
+
+# -------- WAIT FOR SHELL --------
+expect {
+    "$ " {}
+    "# " {}
+}
+
+# -------- RUN DEVOPS CHECKS --------
+send "hostname\r"
+expect -re {.*[\$#] }
+
+send "uptime\r"
+expect -re {.*[\$#] }
+
+send "systemctl is-active nginx\r"
+expect -re {.*[\$#] }
+
+# -------- RESTART SERVICE WITH SUDO --------
+send "sudo systemctl restart nginx\r"
+
+expect {
+    "*assword*" {
+        send "$sudopass\r"
+    }
+}
+
+expect -re {.*[\$#] }
+
+# -------- VERIFY --------
+send "systemctl status nginx --no-pager | head -n 5\r"
+expect -re {.*[\$#] }
+
+# -------- EXIT --------
+send "exit\r"
+expect eof

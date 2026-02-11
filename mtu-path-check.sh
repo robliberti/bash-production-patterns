@@ -2,17 +2,41 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# -----------------------------------------------------------------------------
 # mtu-path-check.sh
+#
 # Purpose:
-#   Quick MTU/path checks:
-#   - Show local interface MTU
-#   - Attempt "do not fragment" pings to find max safe payload
+#   Quick MTU (Maximum Transmission Unit) / Path MTU diagnostics tool.
+#
+#   Helps answer:
+#     • What MTU is my local interface configured for?
+#     • What is the largest packet size that can traverse the network path
+#       to a destination WITHOUT fragmentation?
+#
+#   This is useful when debugging:
+#     • VPN tunnels (WireGuard, IPsec, OpenVPN)
+#     • Overlay networking (VXLAN, Kubernetes CNI)
+#     • TLS / HTTPS stalls or partial connection failures
+#     • “Ping works but real traffic fails” situations
+#
+#   The script:
+#     1. Displays local interface MTU configuration
+#     2. Uses DF (Don't Fragment) pings to estimate Path MTU
+#     3. Uses binary search to quickly find max safe payload size
 #
 # Usage:
 #   ./mtu-path-check.sh <host> [iface]
+#
 # Examples:
 #   ./mtu-path-check.sh 8.8.8.8
 #   ./mtu-path-check.sh 10.0.0.1 wg0
+#
+# Notes:
+#   • IPv4 packet size = payload + 28 bytes (20 IP + 8 ICMP headers)
+#   • Typical Ethernet MTU = 1500 → max ICMP payload ≈ 1472
+#   • TCP MSS typically ≈ MTU - 40 (IP + TCP headers)
+# -----------------------------------------------------------------------------
+
 
 HOST="${1:-}"
 IFACE="${2:-}"
@@ -23,7 +47,19 @@ log() { echo "[$(date -Is)] $*"; }
 
 [[ -n "${HOST}" ]] || die "Usage: $0 <host> [iface]"
 
-# Local MTU display
+# -----------------------------------------------------------------------------
+# show_local_mtu()
+#
+# Displays MTU configuration for local interfaces.
+#
+# Why this matters:
+#   Path MTU can never exceed local interface MTU.
+#   If local MTU is already reduced (ex: VPN or tunnel), that becomes the ceiling.
+#
+# Supports:
+#   • ip (modern Linux)
+#   • ifconfig (legacy / BSD / macOS)
+# -----------------------------------------------------------------------------
 show_local_mtu() {
   log "Local MTU info"
   if have ip; then
@@ -43,9 +79,28 @@ show_local_mtu() {
   fi
 }
 
-# Find max payload with DF set:
-# IPv4 total packet size = payload + 28 (IP+ICMP headers)
-# So if MTU is 1500, typical max ping payload is 1472.
+# -----------------------------------------------------------------------------
+# find_max_payload_ipv4()
+#
+# Determines largest ICMP payload that can be sent WITHOUT fragmentation.
+#
+# Method:
+#   • Uses DF (Don't Fragment) bit
+#   • Uses binary search to efficiently find max working size
+#
+# Why DF matters:
+#   If packet exceeds path MTU and DF is set:
+#     → Router drops packet
+#     → Allows detection of MTU boundary
+#
+# Why binary search:
+#   Faster than linear decrement testing
+#   Good for automation / scripting environments
+#
+# Limitations:
+#   • If ICMP is blocked, results may be inconclusive
+#   • Some networks silently drop oversized packets
+# -----------------------------------------------------------------------------
 find_max_payload_ipv4() {
   log "Finding max IPv4 ping payload with DF bit set to ${HOST}"
   if ! have ping; then
@@ -54,18 +109,24 @@ find_max_payload_ipv4() {
   fi
 
   # Try Linux ping syntax first: -M do
+  # Binary search bounds
+  # 1200 chosen as safe lower bound across most tunnel environments
+  # 1472 chosen as typical max for MTU 1500 Ethernet
   local low=1200
   local high=1472
   local best=0
 
   # Quick pre-check
+  # Basic reachability check (not MTU-related, just sanity check)
   if ping -c 1 -W 2 "${HOST}" >/dev/null 2>&1; then
     log "Basic reachability OK"
   else
     log "Host not reachable by basic ping, continuing anyway"
   fi
 
-  # Determine ping flavor
+  # Detect ping implementation differences
+  # Linux: supports -M do for DF
+  # BSD/macOS: uses -D for DF
   local linux_df_ok=0
   if ping -c 1 -W 2 -M do -s 1400 "${HOST}" >/dev/null 2>&1; then
     linux_df_ok=1
